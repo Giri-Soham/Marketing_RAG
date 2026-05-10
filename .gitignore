@@ -1,0 +1,16 @@
+# Secret keys — never commit these
+.env
+
+# Virtual environment — too large to commit
+venv/
+
+# FAISS index files we'll generate
+*.faiss
+*.pkl
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Mac clutter
+.DS_Store
