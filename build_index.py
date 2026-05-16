@@ -66,7 +66,7 @@ def embed_chunks(chunks, model_name="all-MiniLM-L6-v2"):
 
     print(f"\nEmbedding complete. Shape: {embeddings.shape}")
     # embeddings.shape will print something like (705, 384)
-    # 705 = number of chunks, 384 = vector dimensions
+    # 720 = number of chunks, 384 = vector dimensions
     return embeddings
 
 

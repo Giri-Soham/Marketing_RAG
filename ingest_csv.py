@@ -8,54 +8,107 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 def clean_csv(df):
     """
     Fix columns that should be numeric but are stored as strings.
-
-    Acquisition_Cost: '$16,174.00' → 16174.00
-      - strip '$' removes the dollar sign
-      - replace(',', '') removes the comma thousands separator
-      - astype(float) converts the clean string to a number
-
-    Duration: '30 days' → 30
-      - str.replace(' days', '') strips the text
-      - astype(int) converts to integer
+    Acquisition_Cost: '$16,174.00' -> 16174.00
+    Duration: '30 days' -> 30
     """
     df["Acquisition_Cost"] = (
         df["Acquisition_Cost"]
-        .str.replace("$", "", regex=False)   # remove dollar sign
-        .str.replace(",", "", regex=False)   # remove comma separator
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
         .astype(float)
     )
-
     df["Duration"] = (
         df["Duration"]
-        .str.replace(" days", "", regex=False)  # remove ' days' text
+        .str.replace(" days", "", regex=False)
         .astype(int)
     )
-
     print("Cleaned Acquisition_Cost and Duration columns")
     return df
 
 
+def build_comparison_chunks(df):
+    """
+    Build natural language comparison summaries that directly answer
+    'which channel has the highest/lowest X' questions.
+
+    These are the chunks BM25 was missing — no single group summary
+    says 'highest' or 'lowest', so comparative queries scored poorly.
+    Adding explicit comparison sentences fixes this directly.
+
+    We build comparisons for every key metric across two dimensions:
+      - Channel_Used (Email, Google Ads, Facebook, etc.)
+      - Campaign_Type (Email, Influencer, Social Media, etc.)
+    """
+    chunks = []
+    metrics = {
+        "Conversion_Rate": ("conversion rate", "{:.2%}"),
+        "ROI":             ("ROI",             "{:.2f}x"),
+        "Acquisition_Cost":("acquisition cost","${:,.2f}"),
+        "Clicks":          ("clicks",          "{:,.0f}"),
+        "Engagement_Score":("engagement score","{:.1f}/10"),
+    }
+    dimensions = ["Channel_Used", "Campaign_Type"]
+
+    for dim in dimensions:
+        dim_label = "channel" if dim == "Channel_Used" else "campaign type"
+        grouped = df.groupby(dim).agg({m: "mean" for m in metrics}).reset_index()
+
+        for metric_col, (metric_name, fmt) in metrics.items():
+            sorted_asc  = grouped.sort_values(metric_col, ascending=True)
+            sorted_desc = grouped.sort_values(metric_col, ascending=False)
+
+            best  = sorted_desc.iloc[0]
+            worst = sorted_asc.iloc[0]
+
+            # format all values for the ranking sentence
+            ranking = ", ".join(
+                f"{row[dim]} ({fmt.format(row[metric_col])})"
+                for _, row in sorted_desc.iterrows()
+            )
+
+            text = (
+                f"Among all {dim_label}s, {best[dim]} has the highest average {metric_name} "
+                f"at {fmt.format(best[metric_col])}, while {worst[dim]} has the lowest "
+                f"at {fmt.format(worst[metric_col])}. "
+                f"Full ranking by {metric_name}: {ranking}."
+            )
+
+            chunks.append({
+                "text":     text,
+                "source":   f"Campaign Data: {dim_label} comparison by {metric_name}",
+                "presplit": True,
+            })
+
+    print(f"  Created {len(chunks)} comparison summary chunks")
+    return chunks
+
+
 def load_csv(path):
     """
-    Load the CSV and create two types of text representations:
+    Load the CSV and create three types of text representations:
 
-    A) Group summaries — average performance per Campaign_Type + Channel_Used
-       combination. Answers strategic questions like "which channel has best ROI?"
+    A) Comparison summaries — best/worst/ranking per metric per dimension
+       Directly answers 'which channel has the highest X?' questions.
 
-    B) Individual samples — 300 random rows for row-level detail.
-       Answers specific questions like "tell me about influencer campaigns."
+    B) Group summaries — average performance per Campaign_Type + Channel_Used
+       Answers strategic questions like 'how did email campaigns perform?'
+
+    C) Individual samples — 300 random rows for row-level detail.
+       Answers specific questions like 'tell me about influencer campaigns.'
     """
     df = pd.read_csv(path)
     print(f"Loaded CSV: {df.shape[0]:,} rows x {df.shape[1]} columns")
-
-    # clean the problematic columns before any numeric operations
     df = clean_csv(df)
 
     pages = []
 
-    # ── A) GROUP SUMMARIES ────────────────────────────────────────────────────
-    print("Creating group summaries...")
+    # ── A) COMPARISON SUMMARIES ───────────────────────────────────────────────
+    print("Creating comparison summary chunks...")
+    comparison_chunks = build_comparison_chunks(df)
+    pages.extend(comparison_chunks)
 
+    # ── B) GROUP SUMMARIES ────────────────────────────────────────────────────
+    print("Creating group summaries...")
     summary_df = (
         df.groupby(["Campaign_Type", "Channel_Used"])
         .agg(
@@ -84,15 +137,15 @@ def load_csv(path):
             f"This is based on {row['total_campaigns']} campaigns in the dataset."
         )
         pages.append({
-            "text": text,
-            "source": f"Campaign Data: {row['Campaign_Type']} via {row['Channel_Used']}"
+            "text":     text,
+            "source":   f"Campaign Data: {row['Campaign_Type']} via {row['Channel_Used']}",
+            "presplit": True,
         })
 
-    print(f"  Created {len(pages)} group summary rows")
+    print(f"  Created {len(summary_df)} group summary rows")
 
-    # ── B) INDIVIDUAL SAMPLES ─────────────────────────────────────────────────
+    # ── C) INDIVIDUAL SAMPLES ─────────────────────────────────────────────────
     print("Creating individual campaign samples...")
-
     sample_df = df.sample(n=min(300, len(df)), random_state=42)
 
     for _, row in sample_df.iterrows():
@@ -116,6 +169,7 @@ def load_csv(path):
     print(f"\nTotal pages to chunk: {len(pages)}")
     return pages
 
+
 # ── 2. CHUNK ──────────────────────────────────────────────────────────────────
 
 def chunk_pages(pages):
@@ -124,19 +178,16 @@ def chunk_pages(pages):
         chunk_overlap=50,
         separators=["\n\n", "\n", ".", " "]
     )
-
     chunks = []
-
     for page in pages:
-        splits = splitter.split_text(page["text"])
-        for split in splits:
-            chunks.append({
-                "text": split,
-                "source": page["source"]
-            })
-
+        if page.get("presplit"):
+            chunks.append({"text": page["text"], "source": page["source"]})
+        else:
+            for split in splitter.split_text(page["text"]):
+                chunks.append({"text": split, "source": page["source"]})
     print(f"Created {len(chunks)} chunks from CSV")
     return chunks
+
 
 # ── 3. SAVE ───────────────────────────────────────────────────────────────────
 
@@ -144,6 +195,7 @@ def save_chunks(chunks, output_path):
     with open(output_path, "wb") as f:
         pickle.dump(chunks, f)
     print(f"Saved chunks to {output_path}")
+
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
@@ -153,7 +205,6 @@ if __name__ == "__main__":
 
     if not os.path.exists(csv_path):
         print(f"ERROR: Could not find {csv_path}")
-        print("Make sure your CSV is in the data/ folder")
     else:
         pages  = load_csv(csv_path)
         chunks = chunk_pages(pages)
@@ -166,5 +217,3 @@ if __name__ == "__main__":
                 print(f"Source : {chunk['source']}")
                 print(f"Text   : {chunk['text'][:200]}")
                 print()
-        else:
-            print("\nERROR: 0 chunks — paste the output here and we'll debug.")
